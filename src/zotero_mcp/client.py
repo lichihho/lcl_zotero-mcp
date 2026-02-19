@@ -247,6 +247,220 @@ def generate_bibtex(item: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _parse_bibtex_authors(author_string: str) -> list[dict[str, str]]:
+    """
+    Parse BibTeX author string into Zotero creator format.
+
+    Handles:
+    - "Last, First and Last, First" format
+    - "First Last and First Last" format
+
+    Args:
+        author_string: BibTeX-formatted author string.
+
+    Returns:
+        List of Zotero creator dicts.
+    """
+    creators = []
+    authors = [a.strip() for a in author_string.split(" and ")]
+    for author in authors:
+        if not author:
+            continue
+        if author.lower() == "others":
+            continue
+        if "," in author:
+            parts = author.split(",", 1)
+            last_name = parts[0].strip()
+            first_name = parts[1].strip()
+        else:
+            parts = author.rsplit(" ", 1)
+            if len(parts) == 2:
+                first_name = parts[0].strip()
+                last_name = parts[1].strip()
+            else:
+                first_name = ""
+                last_name = parts[0].strip()
+        creators.append({
+            "creatorType": "author",
+            "firstName": first_name,
+            "lastName": last_name,
+        })
+    return creators
+
+
+def _strip_latex(text: str) -> str:
+    """
+    Remove common LaTeX escape sequences and convert to Unicode.
+
+    Args:
+        text: String possibly containing LaTeX commands.
+
+    Returns:
+        Cleaned string with Unicode characters.
+    """
+    import re
+
+    if not text:
+        return text
+
+    result = text
+
+    replacements = [
+        # Umlaut (diaeresis)
+        ('{\\"a}', '\u00e4'), ('{\\"o}', '\u00f6'), ('{\\"u}', '\u00fc'),
+        ('{\\"A}', '\u00c4'), ('{\\"O}', '\u00d6'), ('{\\"U}', '\u00dc'),
+        ('{\\"e}', '\u00eb'), ('{\\"i}', '\u00ef'),
+        ('\\"a', '\u00e4'), ('\\"o', '\u00f6'), ('\\"u', '\u00fc'),
+        ('\\"A', '\u00c4'), ('\\"O', '\u00d6'), ('\\"U', '\u00dc'),
+        # Acute
+        ("{\\'a}", '\u00e1'), ("{\\'e}", '\u00e9'), ("{\\'i}", '\u00ed'),
+        ("{\\'o}", '\u00f3'), ("{\\'u}", '\u00fa'),
+        ("{\\'A}", '\u00c1'), ("{\\'E}", '\u00c9'), ("{\\'O}", '\u00d3'),
+        ("{\\'U}", '\u00da'),
+        ("\\'a", '\u00e1'), ("\\'e", '\u00e9'), ("\\'i", '\u00ed'),
+        ("\\'o", '\u00f3'), ("\\'u", '\u00fa'),
+        # Grave
+        ('{\\`a}', '\u00e0'), ('{\\`e}', '\u00e8'), ('{\\`o}', '\u00f2'),
+        ('{\\`u}', '\u00f9'),
+        ('\\`a', '\u00e0'), ('\\`e', '\u00e8'), ('\\`o', '\u00f2'),
+        ('\\`u', '\u00f9'),
+        # Circumflex
+        ('{\\^a}', '\u00e2'), ('{\\^e}', '\u00ea'), ('{\\^o}', '\u00f4'),
+        ('{\\^u}', '\u00fb'),
+        ('\\^a', '\u00e2'), ('\\^e', '\u00ea'), ('\\^o', '\u00f4'),
+        ('\\^u', '\u00fb'),
+        # Tilde
+        ('{\\~a}', '\u00e3'), ('{\\~n}', '\u00f1'), ('{\\~o}', '\u00f5'),
+        ('\\~a', '\u00e3'), ('\\~n', '\u00f1'), ('\\~o', '\u00f5'),
+        # Caron
+        ('{\\v{c}}', '\u010d'), ('{\\v{s}}', '\u0161'), ('{\\v{z}}', '\u017e'),
+        ('{\\v c}', '\u010d'), ('{\\v s}', '\u0161'), ('{\\v z}', '\u017e'),
+        ('\\v{c}', '\u010d'), ('\\v{s}', '\u0161'), ('\\v{z}', '\u017e'),
+        ('{\\v{C}}', '\u010c'), ('{\\v{S}}', '\u0160'), ('{\\v{Z}}', '\u017d'),
+        ('\\v{C}', '\u010c'), ('\\v{S}', '\u0160'), ('\\v{Z}', '\u017d'),
+        # Cedilla
+        ('{\\c{c}}', '\u00e7'), ('{\\c c}', '\u00e7'), ('\\c{c}', '\u00e7'),
+        ('{\\c{C}}', '\u00c7'), ('\\c{C}', '\u00c7'),
+        # Misc
+        ('{\\ss}', '\u00df'), ('\\ss', '\u00df'),
+        ('{\\ae}', '\u00e6'), ('\\ae', '\u00e6'),
+        ('{\\oe}', '\u0153'), ('\\oe', '\u0153'),
+        ('{\\AE}', '\u00c6'), ('\\AE', '\u00c6'),
+        ('{\\OE}', '\u0152'), ('\\OE', '\u0152'),
+        ('{\\aa}', '\u00e5'), ('\\aa', '\u00e5'),
+        ('{\\AA}', '\u00c5'), ('\\AA', '\u00c5'),
+        ('{\\o}', '\u00f8'), ('\\o', '\u00f8'),
+        ('{\\O}', '\u00d8'), ('\\O', '\u00d8'),
+    ]
+
+    for latex, unicode_char in replacements:
+        result = result.replace(latex, unicode_char)
+
+    result = result.replace("{", "").replace("}", "")
+    result = re.sub(r'\\(?:textit|textbf|textrm|textsf|texttt|emph)\s*', '', result)
+
+    return result.strip()
+
+
+def parse_bibtex_to_zotero_items(
+    bibtex_string: str,
+    zot: Any,
+    collection_key: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """
+    Parse BibTeX string and convert to Zotero item dicts.
+
+    Args:
+        bibtex_string: BibTeX-formatted string containing one or more entries.
+        zot: Authenticated pyzotero client (used for item_template).
+        collection_key: Optional collection key to assign items to.
+
+    Returns:
+        List of Zotero item dicts ready for create_items().
+    """
+    import bibtexparser
+
+    bib_db = bibtexparser.loads(bibtex_string)
+
+    type_map = {
+        "article": "journalArticle",
+        "inproceedings": "conferencePaper",
+        "conference": "conferencePaper",
+        "book": "book",
+        "incollection": "bookSection",
+        "phdthesis": "thesis",
+        "mastersthesis": "thesis",
+        "techreport": "report",
+        "misc": "document",
+        "unpublished": "manuscript",
+        "inbook": "bookSection",
+        "proceedings": "book",
+    }
+
+    field_map = {
+        "title": "title",
+        "journal": "publicationTitle",
+        "volume": "volume",
+        "number": "issue",
+        "pages": "pages",
+        "year": "date",
+        "doi": "DOI",
+        "url": "url",
+        "abstract": "abstractNote",
+        "publisher": "publisher",
+        "address": "place",
+        "isbn": "ISBN",
+        "issn": "ISSN",
+        "note": "extra",
+        "keywords": "tags",
+    }
+
+    items = []
+    for entry in bib_db.entries:
+        entry_type = entry.get("ENTRYTYPE", "misc").lower()
+        item_type = type_map.get(entry_type, "document")
+        template = zot.item_template(item_type)
+
+        for bib_field, zotero_field in field_map.items():
+            value = entry.get(bib_field)
+            if not value:
+                continue
+            raw = _strip_latex(value)
+
+            if zotero_field == "tags":
+                keywords = [k.strip() for k in raw.split(",") if k.strip()]
+                template["tags"] = [{"tag": kw} for kw in keywords]
+            else:
+                template[zotero_field] = raw
+
+        booktitle = entry.get("booktitle")
+        if booktitle:
+            bt_value = _strip_latex(booktitle)
+            if item_type == "conferencePaper":
+                template["proceedingsTitle"] = bt_value
+            elif item_type == "bookSection":
+                template["bookTitle"] = bt_value
+
+        author = entry.get("author")
+        if author:
+            template["creators"] = _parse_bibtex_authors(_strip_latex(author))
+
+        editor = entry.get("editor")
+        if editor:
+            editors = _parse_bibtex_authors(_strip_latex(editor))
+            for ed in editors:
+                ed["creatorType"] = "editor"
+            existing = template.get("creators", [])
+            template["creators"] = existing + editors
+
+        if collection_key:
+            template["collections"] = [collection_key]
+
+        items.append(template)
+
+    return items
+
+
 def get_attachment_details(
     zot: zotero.Zotero, item: dict[str, Any]
 ) -> AttachmentDetails | None:

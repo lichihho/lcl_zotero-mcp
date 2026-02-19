@@ -5,7 +5,7 @@ Note: ChatGPT requires specific tool names "search" and "fetch", and so they
 are defined and used and piped through to the main server tools. See bottom of file for details.
 """
 
-from typing import Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 import os
 import sys
 import uuid
@@ -23,6 +23,7 @@ from zotero_mcp.client import (
     generate_bibtex,
     get_attachment_details,
     get_zotero_client,
+    parse_bibtex_to_zotero_items,
 )
 import requests
 
@@ -1887,6 +1888,497 @@ def create_note(
     except Exception as e:
         ctx.error(f"Error creating note: {str(e)}")
         return f"Error creating note: {str(e)}"
+
+
+def _create_items_via_connector(
+    items: list[dict[str, Any]],
+    ctx: Context,
+) -> tuple[bool, str]:
+    """
+    Create items via Zotero connector API (local mode).
+
+    Args:
+        items: List of Zotero item dicts (pyzotero template format).
+        ctx: MCP context for logging.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    port = os.getenv("ZOTERO_LOCAL_PORT", "23119")
+    connector_url = f"http://127.0.0.1:{port}/connector/saveItems"
+
+    connector_items = []
+    for item in items:
+        ci = dict(item)
+        if "tags" in ci and ci["tags"]:
+            ci["tags"] = [
+                t["tag"] if isinstance(t, dict) else t
+                for t in ci["tags"]
+            ]
+        for field in ("key", "version", "dateAdded", "dateModified", "relations"):
+            ci.pop(field, None)
+        connector_items.append(ci)
+
+    resp = requests.post(
+        connector_url,
+        headers={"Content-Type": "application/json"},
+        json={"items": connector_items, "uri": "about:blank"},
+        timeout=60,
+    )
+
+    if resp.status_code == 201:
+        return True, resp.text
+    return False, f"HTTP {resp.status_code}: {resp.text}"
+
+
+@mcp.tool(
+    name="zotero_create_collection",
+    description="Create a new collection (folder) in Zotero. Optionally nest it under an existing collection."
+)
+def create_collection(
+    name: str,
+    parent_collection_key: str | None = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Create a new collection in Zotero.
+
+    Args:
+        name: Name for the new collection.
+        parent_collection_key: Key of the parent collection for nesting (optional).
+        ctx: MCP context.
+
+    Returns:
+        Confirmation with collection key.
+    """
+    try:
+        if not name or not name.strip():
+            return "Error: Collection name cannot be empty"
+
+        ctx.info(f"Creating collection '{name}'")
+        zot = get_zotero_client()
+
+        payload = {"name": name.strip()}
+        if parent_collection_key:
+            payload["parentCollection"] = parent_collection_key
+
+        result = zot.create_collections([payload])
+
+        if isinstance(result, dict) and "success" in result:
+            successful = result.get("success", {})
+            if successful:
+                coll_key = list(successful.values())[0]
+                lines = [
+                    "# Collection Created",
+                    "",
+                    f"**Name:** {name}",
+                    f"**Key:** {coll_key}",
+                ]
+                if parent_collection_key:
+                    lines.append(f"**Parent:** {parent_collection_key}")
+                return "\n".join(lines)
+            failed = result.get("failed", {})
+            return f"Failed to create collection: {failed}"
+
+        return f"# Collection Created\n\n**Name:** {name}\n\nResponse: {result}"
+
+    except Exception as e:
+        ctx.error(f"Error creating collection: {str(e)}")
+        return f"Error creating collection: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_import_bibtex",
+    description="Import references from a BibTeX string into Zotero. Supports common entry types (article, book, inproceedings, etc.). Optionally assign imported items to a collection."
+)
+def import_bibtex(
+    bibtex_string: str,
+    collection_key: str | None = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Import BibTeX entries into Zotero.
+
+    Args:
+        bibtex_string: BibTeX-formatted string with one or more entries.
+        collection_key: Optional collection key to assign items to.
+        ctx: MCP context.
+
+    Returns:
+        Import summary with success/failure counts.
+    """
+    try:
+        if not bibtex_string or not bibtex_string.strip():
+            return "Error: BibTeX string cannot be empty"
+
+        ctx.info("Parsing BibTeX input")
+        zot = get_zotero_client()
+
+        items = parse_bibtex_to_zotero_items(bibtex_string, zot, collection_key)
+
+        if not items:
+            return "No valid BibTeX entries found in the input."
+
+        ctx.info(f"Parsed {len(items)} entries, creating items")
+
+        batch_size = 50
+        total_success = 0
+        total_failed = 0
+        created_keys: list[str] = []
+        errors: list[str] = []
+
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+
+            if is_local_mode():
+                ok, msg = _create_items_via_connector(batch, ctx)
+                if ok:
+                    total_success += len(batch)
+                else:
+                    total_failed += len(batch)
+                    errors.append(msg)
+            else:
+                result = zot.create_items(batch)
+                if isinstance(result, dict):
+                    successful = result.get("success", {})
+                    failed = result.get("failed", {})
+                    total_success += len(successful)
+                    total_failed += len(failed)
+                    created_keys.extend(successful.values())
+                    if failed:
+                        errors.append(str(failed))
+                else:
+                    total_success += len(batch)
+
+        lines = [
+            "# BibTeX Import Results",
+            "",
+            f"**Entries parsed:** {len(items)}",
+            f"**Successfully created:** {total_success}",
+            f"**Failed:** {total_failed}",
+        ]
+
+        if collection_key:
+            lines.append(f"**Collection:** {collection_key}")
+
+        if created_keys:
+            lines.append("")
+            lines.append("## Created Item Keys")
+            for key in created_keys:
+                lines.append(f"- `{key}`")
+
+        if errors:
+            lines.append("")
+            lines.append("## Errors")
+            for err in errors:
+                lines.append(f"- {err}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        ctx.error(f"Error importing BibTeX: {str(e)}")
+        return f"Error importing BibTeX: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_add_to_collection",
+    description="Add existing Zotero items to a collection."
+)
+def add_to_collection(
+    item_keys: list[str] | str,
+    collection_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Add items to a Zotero collection.
+
+    Args:
+        item_keys: List of item keys (or JSON string array) to add.
+        collection_key: Target collection key.
+        ctx: MCP context.
+
+    Returns:
+        Summary of the operation.
+    """
+    try:
+        if not collection_key:
+            return "Error: Collection key cannot be empty"
+
+        if isinstance(item_keys, str):
+            try:
+                item_keys = json.loads(item_keys)
+            except json.JSONDecodeError:
+                item_keys = [item_keys]
+
+        if not item_keys:
+            return "Error: No item keys provided"
+
+        ctx.info(f"Adding {len(item_keys)} items to collection {collection_key}")
+        zot = get_zotero_client()
+
+        added = 0
+        skipped = 0
+        errors_list: list[str] = []
+
+        for item_key in item_keys:
+            try:
+                item = zot.item(item_key)
+                collections = item["data"].get("collections", [])
+                if collection_key in collections:
+                    skipped += 1
+                    continue
+                item["data"]["collections"] = collections + [collection_key]
+                zot.update_item(item)
+                added += 1
+            except Exception as e:
+                errors_list.append(f"`{item_key}`: {str(e)}")
+
+        lines = [
+            "# Add to Collection Results",
+            "",
+            f"**Collection:** {collection_key}",
+            f"**Added:** {added}",
+            f"**Already in collection:** {skipped}",
+        ]
+
+        if errors_list:
+            lines.append(f"**Errors:** {len(errors_list)}")
+            lines.append("")
+            for err in errors_list:
+                lines.append(f"- {err}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        ctx.error(f"Error adding to collection: {str(e)}")
+        return f"Error adding to collection: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_create_item",
+    description="Create a single Zotero item with specified metadata fields."
+)
+def create_item(
+    item_type: str,
+    title: str,
+    creators: list[dict[str, str]] | str | None = None,
+    date: str | None = None,
+    abstract: str | None = None,
+    publication_title: str | None = None,
+    volume: str | None = None,
+    issue: str | None = None,
+    pages: str | None = None,
+    doi: str | None = None,
+    url: str | None = None,
+    tags: list[str] | str | None = None,
+    collection_keys: list[str] | str | None = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Create a single Zotero item.
+
+    Args:
+        item_type: Zotero item type (e.g. journalArticle, book, conferencePaper).
+        title: Item title.
+        creators: List of creator dicts with creatorType/firstName/lastName, or JSON string.
+        date: Publication date.
+        abstract: Abstract text.
+        publication_title: Journal or publication name.
+        volume: Volume number.
+        issue: Issue number.
+        pages: Page range.
+        doi: Digital Object Identifier.
+        url: URL for the item.
+        tags: List of tags or JSON string array.
+        collection_keys: List of collection keys or JSON string array.
+        ctx: MCP context.
+
+    Returns:
+        Confirmation with item key.
+    """
+    try:
+        if not item_type:
+            return "Error: item_type is required"
+        if not title:
+            return "Error: title is required"
+
+        ctx.info(f"Creating {item_type}: {title}")
+        zot = get_zotero_client()
+
+        template = zot.item_template(item_type)
+        template["title"] = title
+
+        if date:
+            template["date"] = date
+        if abstract:
+            template["abstractNote"] = abstract
+        if publication_title:
+            template["publicationTitle"] = publication_title
+        if volume:
+            template["volume"] = volume
+        if issue:
+            template["issue"] = issue
+        if pages:
+            template["pages"] = pages
+        if doi:
+            template["DOI"] = doi
+        if url:
+            template["url"] = url
+
+        if creators:
+            if isinstance(creators, str):
+                creators = json.loads(creators)
+            template["creators"] = creators
+
+        if tags:
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except json.JSONDecodeError:
+                    tags = [tags]
+            template["tags"] = [{"tag": t} for t in tags]
+
+        if collection_keys:
+            if isinstance(collection_keys, str):
+                try:
+                    collection_keys = json.loads(collection_keys)
+                except json.JSONDecodeError:
+                    collection_keys = [collection_keys]
+            template["collections"] = collection_keys
+
+        if is_local_mode():
+            ok, msg = _create_items_via_connector([template], ctx)
+            if ok:
+                return f"# Item Created\n\n**Type:** {item_type}\n**Title:** {title}"
+            return f"Error creating item: {msg}"
+        else:
+            result = zot.create_items([template])
+            if isinstance(result, dict) and "success" in result:
+                successful = result.get("success", {})
+                if successful:
+                    item_key = list(successful.values())[0]
+                    return (
+                        f"# Item Created\n\n"
+                        f"**Type:** {item_type}\n"
+                        f"**Title:** {title}\n"
+                        f"**Key:** {item_key}"
+                    )
+                return f"Failed to create item: {result.get('failed', 'Unknown error')}"
+            return f"# Item Created\n\n**Type:** {item_type}\n**Title:** {title}"
+
+    except Exception as e:
+        ctx.error(f"Error creating item: {str(e)}")
+        return f"Error creating item: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_update_item_metadata",
+    description="Update metadata fields of an existing Zotero item."
+)
+def update_item_metadata(
+    item_key: str,
+    fields: dict | str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Update metadata fields of an existing Zotero item.
+
+    Args:
+        item_key: Zotero item key to update.
+        fields: Dict of field names to new values, or JSON string.
+        ctx: MCP context.
+
+    Returns:
+        Confirmation of updated fields.
+    """
+    try:
+        if not item_key:
+            return "Error: item_key is required"
+
+        if isinstance(fields, str):
+            fields = json.loads(fields)
+
+        if not fields:
+            return "Error: No fields to update"
+
+        ctx.info(f"Updating item {item_key}")
+        zot = get_zotero_client()
+
+        item = zot.item(item_key)
+        title = item["data"].get("title", "Untitled")
+
+        updated_fields = []
+        for field, value in fields.items():
+            item["data"][field] = value
+            updated_fields.append(field)
+
+        zot.update_item(item)
+
+        lines = [
+            "# Item Updated",
+            "",
+            f"**Key:** {item_key}",
+            f"**Title:** {title}",
+            "",
+            "## Updated Fields",
+        ]
+        for field in updated_fields:
+            lines.append(f"- `{field}`: {fields[field]}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        ctx.error(f"Error updating item: {str(e)}")
+        return f"Error updating item: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_delete_item",
+    description="Permanently delete a Zotero item. WARNING: This action cannot be undone. The item and all its child notes/attachments will be removed."
+)
+def delete_item(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Permanently delete a Zotero item.
+
+    Args:
+        item_key: Zotero item key to delete.
+        ctx: MCP context.
+
+    Returns:
+        Deletion confirmation.
+    """
+    try:
+        if not item_key:
+            return "Error: item_key is required"
+
+        ctx.info(f"Deleting item {item_key}")
+        zot = get_zotero_client()
+
+        item = zot.item(item_key)
+        title = item["data"].get("title", "Untitled")
+        item_type = item["data"].get("itemType", "unknown")
+
+        zot.delete_item(item)
+
+        return (
+            f"# Item Deleted\n\n"
+            f"**Key:** {item_key}\n"
+            f"**Title:** {title}\n"
+            f"**Type:** {item_type}"
+        )
+
+    except Exception as e:
+        ctx.error(f"Error deleting item: {str(e)}")
+        return f"Error deleting item: {str(e)}"
 
 
 @mcp.tool(
