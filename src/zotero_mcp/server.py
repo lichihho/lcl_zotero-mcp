@@ -2144,6 +2144,14 @@ def add_to_collection(
         Summary of the operation.
     """
     try:
+        if is_local_mode():
+            return (
+                "Error: Adding items to collections is not supported in local mode "
+                "(Zotero local API does not support PATCH). "
+                "Please drag items into the collection in Zotero, "
+                "or set ZOTERO_LOCAL=false with ZOTERO_API_KEY for remote API access."
+            )
+
         if not collection_key:
             return "Error: Collection key cannot be empty"
 
@@ -2337,6 +2345,14 @@ def update_item_metadata(
         Confirmation of updated fields.
     """
     try:
+        if is_local_mode():
+            return (
+                "Error: Updating items is not supported in local mode "
+                "(Zotero local API does not support PATCH). "
+                "Please edit the item in Zotero, "
+                "or set ZOTERO_LOCAL=false with ZOTERO_API_KEY for remote API access."
+            )
+
         if not item_key:
             return "Error: item_key is required"
 
@@ -2397,6 +2413,14 @@ def delete_item(
         Deletion confirmation.
     """
     try:
+        if is_local_mode():
+            return (
+                "Error: Deleting items is not supported in local mode "
+                "(Zotero local API does not support DELETE). "
+                "Please delete the item in Zotero, "
+                "or set ZOTERO_LOCAL=false with ZOTERO_API_KEY for remote API access."
+            )
+
         if not item_key:
             return "Error: item_key is required"
 
