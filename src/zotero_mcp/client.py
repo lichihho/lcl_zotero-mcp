@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import requests as _requests
 from dotenv import load_dotenv
 from markitdown import MarkItDown
 from pyzotero import zotero
@@ -362,6 +363,28 @@ def _strip_latex(text: str) -> str:
     return result.strip()
 
 
+def get_item_template(zot: Any, item_type: str) -> dict[str, Any]:
+    """
+    Get Zotero item template, falling back to web API for local mode.
+
+    Args:
+        zot: Authenticated pyzotero client.
+        item_type: Zotero item type (e.g. journalArticle).
+
+    Returns:
+        Item template dict.
+    """
+    try:
+        return zot.item_template(item_type)
+    except Exception:
+        resp = _requests.get(
+            f"https://api.zotero.org/items/new?itemType={item_type}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 def parse_bibtex_to_zotero_items(
     bibtex_string: str,
     zot: Any,
@@ -419,7 +442,7 @@ def parse_bibtex_to_zotero_items(
     for entry in bib_db.entries:
         entry_type = entry.get("ENTRYTYPE", "misc").lower()
         item_type = type_map.get(entry_type, "document")
-        template = zot.item_template(item_type)
+        template = get_item_template(zot, item_type)
 
         for bib_field, zotero_field in field_map.items():
             value = entry.get(bib_field)

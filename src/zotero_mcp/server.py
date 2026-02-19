@@ -22,6 +22,7 @@ from zotero_mcp.client import (
     format_item_metadata,
     generate_bibtex,
     get_attachment_details,
+    get_item_template,
     get_zotero_client,
     parse_bibtex_to_zotero_items,
 )
@@ -1957,6 +1958,45 @@ def create_collection(
             return "Error: Collection name cannot be empty"
 
         ctx.info(f"Creating collection '{name}'")
+
+        if is_local_mode():
+            port = os.getenv("ZOTERO_LOCAL_PORT", "23119")
+            api_url = f"http://127.0.0.1:{port}/api/users/0/collections"
+            resp = requests.post(
+                api_url,
+                headers={"Content-Type": "application/json"},
+                json=[{
+                    "name": name.strip(),
+                    "parentCollection": parent_collection_key or False,
+                }],
+                timeout=30,
+            )
+            if resp.status_code in (200, 201):
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict) and "success" in data:
+                        successful = data.get("success", {})
+                        if successful:
+                            coll_key = list(successful.values())[0]
+                            lines = [
+                                "# Collection Created",
+                                "",
+                                f"**Name:** {name}",
+                                f"**Key:** {coll_key}",
+                            ]
+                            if parent_collection_key:
+                                lines.append(f"**Parent:** {parent_collection_key}")
+                            return "\n".join(lines)
+                except Exception:
+                    pass
+                return f"# Collection Created\n\n**Name:** {name}"
+
+            return (
+                f"Error: Zotero local API does not support creating collections "
+                f"(HTTP {resp.status_code}). Please create the collection manually "
+                f"in Zotero, then use `zotero_get_collections` to find its key."
+            )
+
         zot = get_zotero_client()
 
         payload = {"name": name.strip()}
@@ -2209,7 +2249,7 @@ def create_item(
         ctx.info(f"Creating {item_type}: {title}")
         zot = get_zotero_client()
 
-        template = zot.item_template(item_type)
+        template = get_item_template(zot, item_type)
         template["title"] = title
 
         if date:
