@@ -140,12 +140,13 @@ def setup_zotero_environment():
         apply_environment_variables(claude_env_vars)
 
     # Apply fallback defaults for local Zotero if no config found
-    fallback_env_vars = {
-        "ZOTERO_LOCAL": "true",
-        "ZOTERO_LIBRARY_ID": "0",
-    }
-    # Apply fallbacks only if not already set
-    apply_environment_variables(fallback_env_vars)
+    # If ZOTERO_API_KEY is present, assume remote mode — don't default to local
+    if not os.environ.get("ZOTERO_API_KEY"):
+        fallback_env_vars = {
+            "ZOTERO_LOCAL": "true",
+            "ZOTERO_LIBRARY_ID": "0",
+        }
+        apply_environment_variables(fallback_env_vars)
 
 
 def main():
